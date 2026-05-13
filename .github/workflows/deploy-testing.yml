@@ -1,0 +1,212 @@
+name: CI + Deploy to Testing
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-testing
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+  APP_DIR: /home/ubuntu/app
+  FRONTEND_PORT: "80"
+
+jobs:
+  ci:
+    name: Lint, Test, Build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: todo_user
+          POSTGRES_PASSWORD: todo_password
+          POSTGRES_DB: todo_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U todo_user -d todo_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Backend - install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Backend - lint
+        working-directory: backend
+        run: npm run lint
+
+      - name: Backend - unit tests (against Postgres service)
+        working-directory: backend
+        env:
+          DB_HOST: localhost
+          DB_PORT: "5432"
+          DB_USER: todo_user
+          DB_PASSWORD: todo_password
+          DB_NAME: todo_db
+        run: npm run test:ci
+
+      - name: Frontend - install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend - unit tests
+        working-directory: frontend
+        run: npm run test:ci
+
+      - name: Frontend - build
+        working-directory: frontend
+        run: npm run build
+
+  deploy:
+    name: Deploy to Testing EC2
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Trust EC2 host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.EC2_TEST_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Ensure target directory exists on EC2
+        run: |
+          ssh "${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_TEST_HOST }}" \
+            "mkdir -p ${{ env.APP_DIR }}"
+
+      - name: Sync project files to EC2
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            --exclude 'frontend/build' \
+            --exclude '.env' \
+            ./ "${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_TEST_HOST }}:${{ env.APP_DIR }}/"
+
+      - name: Build & start containers on EC2
+        run: |
+          ssh "${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_TEST_HOST }}" \
+            "cd ${{ env.APP_DIR }} && \
+             FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose pull --ignore-pull-failures || true && \
+             FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose up -d --build && \
+             docker compose ps"
+
+      - name: Set deployment URL output
+        id: url
+        run: echo "url=http://${{ secrets.TESTING_IP }}" >> "$GITHUB_OUTPUT"
+
+  notify:
+    name: Notify
+    needs: [ci, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (for commit author lookup)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve developer email
+        id: dev
+        run: |
+          PR_EMAIL="${{ github.event.pull_request.user.email }}"
+          COMMIT_EMAIL="$(git log -1 --pretty=format:'%ae' || true)"
+          if [ -n "$PR_EMAIL" ]; then
+            echo "email=$PR_EMAIL" >> "$GITHUB_OUTPUT"
+          elif [ -n "$COMMIT_EMAIL" ]; then
+            echo "email=$COMMIT_EMAIL" >> "$GITHUB_OUTPUT"
+          else
+            echo "email=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send SUCCESS email to QA
+        if: needs.ci.result == 'success' && needs.deploy.result == 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USER }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          from: "CI Bot <${{ secrets.EMAIL_USER }}>"
+          to: ${{ secrets.QA_EMAIL }}
+          subject: "[Testing] Deployment SUCCESS - ${{ github.repository }}"
+          body: |
+            Hi QA,
+
+            New changes have been deployed to the Testing environment and are ready for validation.
+
+            Repository : ${{ github.repository }}
+            Trigger    : ${{ github.event_name }}
+            Actor      : ${{ github.actor }}
+            Branch     : ${{ github.head_ref || github.ref_name }}
+            Commit     : ${{ github.sha }}
+            PR         : ${{ github.event.pull_request.html_url || 'N/A (manual run)' }}
+
+            Application URL: ${{ needs.deploy.outputs.url }}
+            Health endpoint: ${{ needs.deploy.outputs.url }}/api/health
+
+            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Regards,
+            CI Bot
+
+      - name: Send FAILURE email to instructor + developer
+        if: needs.ci.result != 'success' || needs.deploy.result != 'success'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USER }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          from: "CI Bot <${{ secrets.EMAIL_USER }}>"
+          to: ${{ secrets.INSTRUCTOR_EMAIL }}
+          cc: ${{ steps.dev.outputs.email }}
+          subject: "[Testing] Deployment FAILED - ${{ github.repository }}"
+          body: |
+            The Testing deployment workflow has FAILED.
+
+            Repository  : ${{ github.repository }}
+            Trigger     : ${{ github.event_name }}
+            Developer   : ${{ github.actor }} <${{ steps.dev.outputs.email }}>
+            Branch      : ${{ github.head_ref || github.ref_name }}
+            Commit      : ${{ github.sha }}
+            PR          : ${{ github.event.pull_request.html_url || 'N/A (manual run)' }}
+
+            CI job     : ${{ needs.ci.result }}
+            Deploy job : ${{ needs.deploy.result }}
+
+            Logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
