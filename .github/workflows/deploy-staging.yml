@@ -141,8 +141,15 @@ jobs:
       - name: Resolve developer email
         id: dev
         run: |
+          PR_EMAIL="${{ github.event.pull_request.user.email }}"
           COMMIT_EMAIL="$(git log -1 --pretty=format:'%ae' || true)"
-          echo "email=${COMMIT_EMAIL}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR_EMAIL" ]; then
+            echo "email=$PR_EMAIL" >> "$GITHUB_OUTPUT"
+          elif [ -n "$COMMIT_EMAIL" ]; then
+            echo "email=$COMMIT_EMAIL" >> "$GITHUB_OUTPUT"
+          else
+            echo "email=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Send SUCCESS email to clients / team
         if: needs.ci.result == 'success' && needs.deploy.result == 'success'
