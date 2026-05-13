@@ -91,7 +91,7 @@ jobs:
       - name: Setup SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.EC2_STAGE_HOST }}
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY_STAGING }}
 
       - name: Trust EC2 host key
         run: |
