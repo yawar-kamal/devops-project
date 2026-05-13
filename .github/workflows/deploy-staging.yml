@@ -1,13 +1,12 @@
-name: CI + Deploy to Testing
+name: CI + Deploy to Staging
 
 on:
-  pull_request:
+  push:
     branches: [main]
-    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
-  group: deploy-testing
+  group: deploy-staging
   cancel-in-progress: false
 
 env:
@@ -79,7 +78,7 @@ jobs:
         run: npm run build
 
   deploy:
-    name: Deploy to Testing EC2
+    name: Deploy to Staging EC2
     needs: ci
     runs-on: ubuntu-latest
     outputs:
@@ -92,16 +91,16 @@ jobs:
       - name: Setup SSH key
         uses: webfactory/ssh-agent@v0.9.0
         with:
-          ssh-private-key: ${{ secrets.EC2_TEST_HOST }}
+          ssh-private-key: ${{ secrets.EC2_STAGE_HOST }}
 
       - name: Trust EC2 host key
         run: |
           mkdir -p ~/.ssh
-          ssh-keyscan -H "${{ secrets.TESTING_IP }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.STAGING_IP }}" >> ~/.ssh/known_hosts
 
       - name: Ensure target directory exists on EC2
         run: |
-          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}" \
+          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.STAGING_IP }}" \
             "mkdir -p ${{ env.APP_DIR }}"
 
       - name: Sync project files to EC2
@@ -113,11 +112,11 @@ jobs:
             --exclude 'node_modules' \
             --exclude 'frontend/build' \
             --exclude '.env' \
-            ./ "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}:${{ env.APP_DIR }}/"
+            ./ "${{ secrets.EC2_USERNAME }}@${{ secrets.STAGING_IP }}:${{ env.APP_DIR }}/"
 
       - name: Build & start containers on EC2
         run: |
-          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}" \
+          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.STAGING_IP }}" \
             "cd ${{ env.APP_DIR }} && \
              FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose pull --ignore-pull-failures || true && \
              FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose up -d --build && \
@@ -125,7 +124,7 @@ jobs:
 
       - name: Set deployment URL output
         id: url
-        run: echo "url=http://${{ secrets.TESTING_IP }}" >> "$GITHUB_OUTPUT"
+        run: echo "url=http://${{ secrets.STAGING_IP }}" >> "$GITHUB_OUTPUT"
 
   notify:
     name: Notify
@@ -142,17 +141,10 @@ jobs:
       - name: Resolve developer email
         id: dev
         run: |
-          PR_EMAIL="${{ github.event.pull_request.user.email }}"
           COMMIT_EMAIL="$(git log -1 --pretty=format:'%ae' || true)"
-          if [ -n "$PR_EMAIL" ]; then
-            echo "email=$PR_EMAIL" >> "$GITHUB_OUTPUT"
-          elif [ -n "$COMMIT_EMAIL" ]; then
-            echo "email=$COMMIT_EMAIL" >> "$GITHUB_OUTPUT"
-          else
-            echo "email=" >> "$GITHUB_OUTPUT"
-          fi
+          echo "email=${COMMIT_EMAIL}" >> "$GITHUB_OUTPUT"
 
-      - name: Send SUCCESS email to QA
+      - name: Send SUCCESS email to clients / team
         if: needs.ci.result == 'success' && needs.deploy.result == 'success'
         uses: dawidd6/action-send-mail@v3
         with:
@@ -163,18 +155,18 @@ jobs:
           password: ${{ secrets.EMAIL_PASSWORD }}
           from: "CI Bot <${{ secrets.EMAIL_USER }}>"
           to: ${{ secrets.QA_EMAIL }}
-          subject: "[Testing] Deployment SUCCESS - ${{ github.repository }}"
+          cc: ${{ secrets.INSTRUCTOR_EMAIL }}
+          subject: "[Staging] Deployment SUCCESS - ${{ github.repository }}"
           body: |
-            Hi QA,
+            Hi all,
 
-            New changes have been deployed to the Testing environment and are ready for validation.
+            New changes have been deployed to the Staging environment.
 
             Repository : ${{ github.repository }}
             Trigger    : ${{ github.event_name }}
             Actor      : ${{ github.actor }}
-            Branch     : ${{ github.head_ref || github.ref_name }}
+            Branch     : ${{ github.ref_name }}
             Commit     : ${{ github.sha }}
-            PR         : ${{ github.event.pull_request.html_url || 'N/A (manual run)' }}
 
             Application URL: ${{ needs.deploy.outputs.url }}
             Health endpoint: ${{ needs.deploy.outputs.url }}/api/health
@@ -196,16 +188,15 @@ jobs:
           from: "CI Bot <${{ secrets.EMAIL_USER }}>"
           to: ${{ secrets.INSTRUCTOR_EMAIL }}
           cc: ${{ steps.dev.outputs.email }}
-          subject: "[Testing] Deployment FAILED - ${{ github.repository }}"
+          subject: "[Staging] Deployment FAILED - ${{ github.repository }}"
           body: |
-            The Testing deployment workflow has FAILED.a
+            The Staging deployment workflow has FAILED.
 
             Repository  : ${{ github.repository }}
             Trigger     : ${{ github.event_name }}
             Developer   : ${{ github.actor }} <${{ steps.dev.outputs.email }}>
-            Branch      : ${{ github.head_ref || github.ref_name }}
+            Branch      : ${{ github.ref_name }}
             Commit      : ${{ github.sha }}
-            PR          : ${{ github.event.pull_request.html_url || 'N/A (manual run)' }}
 
             CI job     : ${{ needs.ci.result }}
             Deploy job : ${{ needs.deploy.result }}
