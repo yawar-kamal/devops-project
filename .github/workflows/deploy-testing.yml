@@ -78,9 +78,46 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+  build-and-push:
+    name: Build and push images to ECR
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+        run: |
+          docker build -t "${ECR_REGISTRY}/todo-backend:latest" -t "${ECR_REGISTRY}/todo-backend:${GITHUB_SHA}" ./backend
+          docker push "${ECR_REGISTRY}/todo-backend:latest"
+          docker push "${ECR_REGISTRY}/todo-backend:${GITHUB_SHA}"
+
+      - name: Build and push frontend image
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+        run: |
+          docker build -t "${ECR_REGISTRY}/todo-frontend:latest" -t "${ECR_REGISTRY}/todo-frontend:${GITHUB_SHA}" ./frontend
+          docker push "${ECR_REGISTRY}/todo-frontend:latest"
+          docker push "${ECR_REGISTRY}/todo-frontend:${GITHUB_SHA}"
+
   deploy:
     name: Deploy to Testing EC2
-    needs: ci
+    needs: build-and-push
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.url.outputs.url }}
@@ -89,39 +126,55 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup SSH key
-        uses: webfactory/ssh-agent@v0.9.0
+      - name: On EC2 - ECR login and app directory
+        uses: appleboy/ssh-action@v1
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
         with:
-          ssh-private-key: ${{ secrets.EC2_SSH_KEY_TEST }}
+          host: ${{ secrets.TESTING_IP }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY_TEST }}
+          envs: AWS_REGION,ECR_REGISTRY
+          script: |
+            set -e
+            aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+            mkdir -p ${{ env.APP_DIR }}
 
-      - name: Trust EC2 host key
+      - name: Rsync docker-compose.prod.yml to EC2
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_KEY_TEST }}
+          REMOTE_HOST: ${{ secrets.TESTING_IP }}
+          REMOTE_USER: ${{ secrets.EC2_USERNAME }}
         run: |
+          set -e
           mkdir -p ~/.ssh
-          ssh-keyscan -H "${{ secrets.TESTING_IP }}" >> ~/.ssh/known_hosts
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/ec2_deploy_key
+          chmod 600 ~/.ssh/ec2_deploy_key
+          ssh-keyscan -H "$REMOTE_HOST" >> ~/.ssh/known_hosts
+          rsync -avz \
+            -e "ssh -i ~/.ssh/ec2_deploy_key -o StrictHostKeyChecking=no" \
+            docker-compose.prod.yml \
+            "${REMOTE_USER}@${REMOTE_HOST}:${{ env.APP_DIR }}/"
 
-      - name: Ensure target directory exists on EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}" \
-            "mkdir -p ${{ env.APP_DIR }}"
-
-      - name: Sync project files to EC2
-        run: |
-          rsync -az --delete \
-            -e "ssh -o StrictHostKeyChecking=no" \
-            --exclude '.git' \
-            --exclude '.github' \
-            --exclude 'node_modules' \
-            --exclude 'frontend/build' \
-            --exclude '.env' \
-            ./ "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}:${{ env.APP_DIR }}/"
-
-      - name: Build & start containers on EC2
-        run: |
-          ssh -o StrictHostKeyChecking=no "${{ secrets.EC2_USERNAME }}@${{ secrets.TESTING_IP }}" \
-            "cd ${{ env.APP_DIR }} && \
-             FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose pull --ignore-pull-failures || true && \
-             FRONTEND_PORT=${{ env.FRONTEND_PORT }} docker compose up -d --build && \
-             docker compose ps"
+      - name: On EC2 - substitute registry, pull, and start stack
+        uses: appleboy/ssh-action@v1
+        env:
+          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+          FRONTEND_PORT: ${{ env.FRONTEND_PORT }}
+        with:
+          host: ${{ secrets.TESTING_IP }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY_TEST }}
+          envs: ECR_REGISTRY,FRONTEND_PORT
+          script: |
+            set -e
+            cd ${{ env.APP_DIR }}
+            sed -i "s|PLACEHOLDER_ECR_REGISTRY|${ECR_REGISTRY}|g" docker-compose.prod.yml
+            export FRONTEND_PORT
+            docker compose -f docker-compose.prod.yml pull
+            docker compose -f docker-compose.prod.yml up -d
+            docker compose -f docker-compose.prod.yml ps
 
       - name: Set deployment URL output
         id: url
