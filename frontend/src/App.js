@@ -96,9 +96,6 @@ export default function App() {
           <h1 className="text-4xl font-black uppercase leading-[0.95] tracking-tighter text-bauhaus-fg sm:text-5xl">
             Todo
           </h1>
-          <p className="mt-2 text-sm font-medium leading-relaxed text-bauhaus-fg/75 sm:text-base">
-            React · Express · PostgreSQL — base app for your CI/CD pipeline
-          </p>
         </header>
 
         <form className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-stretch" onSubmit={handleAdd}>

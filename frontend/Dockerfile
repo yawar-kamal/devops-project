@@ -4,6 +4,7 @@ COPY package*.json ./
 RUN npm ci
 COPY public ./public
 COPY src ./src
+COPY tailwind.config.js postcss.config.js ./
 RUN npm run build
 
 FROM nginx:1.27-alpine
